@@ -699,4 +699,3 @@ if __name__ == "__main__":
         client.run()
     else:
         print(f"Invalid command: {args.command}")
-        exit(1)

@@ -8,14 +8,14 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, Header
 import jwt
 import redis.asyncio as redis
-from sqlmodel import SQLModel, Field, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+from sqlmodel import SQLModel, Field, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 
 class DreamServer(FastAPI):
 
-    JWT_SECRET = "fear_is_the_mind_killer"
+    JWT_SECRET = os.getenv("JWT_SECRET", "fear_is_the_mind_killer")
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
     POSTGRES_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/dream_messenger")
 
