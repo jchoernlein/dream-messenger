@@ -1,3 +1,5 @@
 .vscode
+.direnv
 __pycache__
 venv
+*.db
