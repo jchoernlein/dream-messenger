@@ -1,16 +1,20 @@
 import base64
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from hashlib import sha256
 import json
 import os
+import secrets
 from typing import Annotated
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, Header
+from fastapi import FastAPI, WebSocket, Body, Header, HTTPException
 import jwt
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
-from sqlmodel import SQLModel, Field, select
+from sqlmodel import SQLModel, Field
 from sqlmodel.ext.asyncio.session import AsyncSession
+import uvicorn
 
 
 class DreamServer(FastAPI):
@@ -21,7 +25,8 @@ class DreamServer(FastAPI):
 
     class User(SQLModel, table=True):
         username: str = Field(primary_key=True)
-        identity: str
+        identity: str       # Base64-encoded X25519 public key
+        authentication_hash: bytes    # Hash of authentication token.
 
     def __init__(self, *args, **kwargs):
         self.open_websockets: dict[tuple[str, str], WebSocket] = {}
@@ -58,37 +63,45 @@ async def register(
 ):
     async with AsyncSession(app.pg) as session:
         # Check if username is already registered
-        statement = select(DreamServer.User).where(DreamServer.User.username == username)
-        result = await session.exec(statement)
-        existing_user = result.one_or_none()
-        
+
+        existing_user = await session.get(DreamServer.User, username)
         if existing_user:
-            raise Exception("User already registered")
+            raise HTTPException(status_code=400, detail="Username already registered")
 
         # Validate the identity as a proper X25519 public key
         try:
             id_bytes = base64.b64decode(identity)
             X25519PublicKey.from_public_bytes(id_bytes)
         except ValueError:
-            raise Exception("Invalid identity")
+            raise HTTPException(status_code=400, detail="Invalid identity")
+
+        # Compute the authentication token and its hash
+        token_data = {
+            "user": username,
+            "iat": datetime.now(timezone.utc).timestamp(),
+            "nonce": secrets.token_hex(16)
+        }
+        token = jwt.encode(token_data, app.JWT_SECRET, algorithm="HS256")
+        token_hash = sha256(token.encode()).digest()
 
         # Add the new user to the database
-        new_user = DreamServer.User(username=username, identity=identity)
+        new_user = DreamServer.User(
+            username=username, 
+            identity=identity,
+            authentication_hash=token_hash
+        )
         session.add(new_user)
         await session.commit()
 
-        # Return an authentication token for the newly registered user
-        return jwt.encode({"username": username}, app.JWT_SECRET, algorithm="HS256")
+    # Return an authentication token for the newly registered user
+    return token
 
 @app.get("/{recipient}/id")
 async def get_recipient_id(recipient: str):
     async with AsyncSession(app.pg) as session:
-        statement = select(DreamServer.User).where(DreamServer.User.username == recipient)
-        result = await session.exec(statement)
-        user = result.one_or_none()
-        
+        user = await session.get(DreamServer.User, recipient)
         if not user:
-            raise Exception("User not found")
+            raise HTTPException(status_code=404, detail="User not found")
         
         return user.identity
 
@@ -99,15 +112,22 @@ async def chat_endpoint(
     websocket: WebSocket
 ):    
     # Get the sender's username from the token
-    token = jwt.decode(token, app.JWT_SECRET, algorithms=["HS256"])
-    sender = token["username"]
+    token_obj = jwt.decode(token, app.JWT_SECRET, algorithms=["HS256"])
+    sender = token_obj["user"]
 
+    # Verify the sender's authentication token
+    async with AsyncSession(app.pg) as session:
+        user = await session.get(DreamServer.User, sender)
+        token_hash = sha256(token.encode()).digest()
+        if not user or token_hash != user.authentication_hash:
+            raise HTTPException(status_code=401, detail="Invalid authentication")
+    
     if sender == recipient:
-        raise Exception("Cannot chat with yourself")
+        raise HTTPException(status_code=400, detail="Cannot chat with yourself")
 
-    # Close existing WebSocket connection if it exists
+    # Disallow multiple WebSocket connections for the same chat
     if (sender, recipient) in app.open_websockets:
-        raise Exception("WebSocket connection already exists")
+        raise HTTPException(status_code=400, detail="WebSocket connection already exists")
     
     # Accept the new WebSocket and store it
     await websocket.accept()
@@ -133,6 +153,10 @@ async def chat_endpoint(
             else:
                 pending_key = f"pending_messages:{recipient}:{sender}"
                 await app.redis.rpush(pending_key, json.dumps(data))
-    except WebSocketDisconnect:
+    finally:
         if (sender, recipient) in app.open_websockets:
             del app.open_websockets[sender, recipient]
+
+
+if __name__ == "__main__":
+    uvicorn.run(app)

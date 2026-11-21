@@ -1,3 +1,4 @@
 Signal Double Ratchet Spec: https://signal.org/docs/specifications/doubleratchet/
 Cryptography Library Docs:  https://cryptography.io/en/latest
 FastAPI:                    https://fastapi.tiangolo.com
+Textual:                    https://textual.textualize.io/

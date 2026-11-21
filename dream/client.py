@@ -74,18 +74,18 @@ class UserInfo(SQLModel, table=True):
     """Data model to represent user information."""
 
     name: str = Field(primary_key=True)
-    identity_key: bytes # Given to other users to establish conversations
-    authentication_key: str  # Used to authenticate with the server
+    identity_key: bytes     # Private key used for establishing conversations
+    authentication_key: str # Used to authenticate with the server
 
 
-class Ratchet(SQLModel, table=True):
-    """Data model to representing a peer, including the Double Ratchet
-    state.
+class ConversationState(SQLModel, table=True):
+    """Data model to represent a conversation with a peer, 
+    including the Double Ratchet state.
     """
 
-    id: int | None= Field(default=None, primary_key=True)
-    name: str = Field(unique=True, index=True)
-    identity_key: bytes
+    peer_id: int | None= Field(default=None, primary_key=True)
+    peer_name: str = Field(unique=True, index=True)
+    peer_identity_key: bytes
 
     # Double Ratchet state for this peer
     dh_sent: bytes
@@ -99,8 +99,8 @@ class Ratchet(SQLModel, table=True):
     prev_num_sent: int = 0
 
     # Relationships
-    skipped_keys: list["SkippedKey"] = Relationship(back_populates="ratchet")
-    messages: list["Message"] = Relationship(back_populates="ratchet")
+    skipped_keys: list["SkippedKey"] = Relationship(back_populates="conversation")
+    messages: list["Message"] = Relationship(back_populates="conversation")
 
     def skip_keys(self, until: int) -> list["SkippedKey"]:
         """Skips keys until given N is reached in receiving chain, 
@@ -123,7 +123,7 @@ class Ratchet(SQLModel, table=True):
             self.chain_key_received, mk = ck_kdf(self.chain_key_received)
             keys.append(
                 SkippedKey(
-                    ratchet_id=self.id,
+                    conversation_id=self.peer_id,
                     dh=self.dh_received,
                     n=self.num_received,
                     mk=mk
@@ -168,26 +168,26 @@ class SkippedKey(SQLModel, table=True):
     """
 
     id: int | None = Field(default=None, primary_key=True)
-    ratchet_id: int = Field(foreign_key="ratchet.id")
+    conversation_id: int = Field(foreign_key="conversationstate.peer_id")
     dh: bytes
     n: int
     mk: bytes
 
     # Relationships
-    ratchet: "Ratchet" = Relationship(back_populates="skipped_keys")
+    conversation: "ConversationState" = Relationship(back_populates="skipped_keys")
 
 
 class Message(SQLModel, table=True):
     """Data model to store messages for a given recipient in the database."""
 
     id: int | None = Field(default=None, primary_key=True)
-    ratchet_id: int = Field(foreign_key="ratchet.id")
+    conversation_id: int = Field(foreign_key="conversationstate.peer_id")
     content: str
     timestamp: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.UTC))
     sent: bool = Field(default=True)
 
     # Relationships
-    ratchet: "Ratchet" = Relationship(back_populates="messages")
+    conversation: "ConversationState" = Relationship(back_populates="messages")
 
 
 class TransmittedMessage(BaseModel):
@@ -213,10 +213,10 @@ class TransmittedMessage(BaseModel):
 
 class Conversation:
 
-    def __init__(self, engine: AsyncEngine, ratchet_id: int):
+    def __init__(self, engine: AsyncEngine, conv_state_id: int):
 
         self.engine: AsyncEngine = engine
-        self.ratchet_id: int = ratchet_id
+        self.conversation_id: int = conv_state_id
 
     @classmethod
     async def create(cls, 
@@ -262,9 +262,9 @@ class Conversation:
         
         # Store the new peer and conversation state in the database
         async with AsyncSession(engine) as session:
-            ratchet = Ratchet(
-                name=peer_name, 
-                identity_key=peer_identity.public_bytes_raw(),
+            conversation = ConversationState(
+                peer_name=peer_name, 
+                peer_identity_key=peer_identity.public_bytes_raw(),
                 dh_sent=DHs.private_bytes_raw(),
                 dh_received=DHr.public_bytes_raw(),
                 root_key=RK,
@@ -272,11 +272,11 @@ class Conversation:
                 chain_key_received=CKr,
                 AD=AD
             )
-            session.add(ratchet)
+            session.add(conversation)
             await session.commit()
-            await session.refresh(ratchet)
+            await session.refresh(conversation)
 
-        return cls(engine, ratchet.id)
+        return cls(engine, conversation.peer_id)
 
     async def send_message(
         self, 
@@ -295,28 +295,28 @@ class Conversation:
         """
 
         async with AsyncSession(self.engine) as session:
-            ratchet = await session.get(Ratchet, self.ratchet_id)
-            if ratchet is None:
+            conversation = await session.get(ConversationState, self.conversation_id)
+            if conversation is None:
                 raise ValueError("Peer not found")
 
             # Get next message key and send chain key
-            ratchet.chain_key_sent, mk = ck_kdf(ratchet.chain_key_sent)
+            conversation.chain_key_sent, mk = ck_kdf(conversation.chain_key_sent)
 
             # Load the most recent DH public key to attach to message
-            DHs = X25519PrivateKey.from_private_bytes(ratchet.dh_sent)
+            DHs = X25519PrivateKey.from_private_bytes(conversation.dh_sent)
             DH = base64.b64encode(DHs.public_key().public_bytes_raw()).decode()
 
             # Prepare the message to be sent.
             header = TransmittedMessage.Header(
                 dh=DH,
-                pn=ratchet.prev_num_sent,
-                n=ratchet.num_sent,
+                pn=conversation.prev_num_sent,
+                n=conversation.num_sent,
                 timestamp=datetime.datetime.now(datetime.UTC)
             )
             ciphertext = AESGCMSIV(mk).encrypt(
                 bytearray(12),
                 content.encode(),
-                ratchet.AD + header.encode()
+                conversation.AD + header.encode()
             )
             transmitted_message = TransmittedMessage(
                 header=header,
@@ -328,11 +328,11 @@ class Conversation:
                 await websocket.send(transmitted_message.model_dump_json())
 
             # Only store the message and update the conversation state if the send was successful
-            ratchet.num_sent += 1
-            session.add(ratchet)
+            conversation.num_sent += 1
+            session.add(conversation)
 
             message = Message(
-                ratchet_id=ratchet.id,
+                conversation_id=conversation.peer_id,
                 content=content,
                 timestamp=header.timestamp
             )
@@ -362,8 +362,8 @@ class Conversation:
         statement = select(SkippedKey).where(SkippedKey.dh == dh, SkippedKey.n == n)
 
         async with AsyncSession(self.engine) as session:
-            ratchet = await session.get(Ratchet, self.ratchet_id)
-            if ratchet is None:
+            conversation = await session.get(ConversationState, self.conversation_id)
+            if conversation is None:
                 raise ValueError("Peer not found")
 
             # Try to get message key from database
@@ -375,31 +375,31 @@ class Conversation:
             # No message key found, so compute
             else:
                 # If received header doesn't match, store keys and ratchet
-                if dh != ratchet.dh_received:
-                    for sk in ratchet.skip_keys(transmitted_message.header.pn):
+                if dh != conversation.dh_received:
+                    for sk in conversation.skip_keys(transmitted_message.header.pn):
                         session.add(sk)
-                    ratchet.dh_ratchet(X25519PublicKey.from_public_bytes(dh))
+                    conversation.dh_ratchet(X25519PublicKey.from_public_bytes(dh))
 
                 # Once ratchet is complete, store keys up until expected N
-                for sk in ratchet.skip_keys(transmitted_message.header.n):
+                for sk in conversation.skip_keys(transmitted_message.header.n):
                     session.add(sk)
 
                 # Get message key and new receiving chain key
-                ratchet.chain_key_received, mk = ck_kdf(ratchet.chain_key_received)
-                ratchet.num_received += 1
+                conversation.chain_key_received, mk = ck_kdf(conversation.chain_key_received)
+                conversation.num_received += 1
 
-                session.add(ratchet)
+                session.add(conversation)
 
             # Decrypt ciphertext with message key
             plaintext = AESGCMSIV(mk).decrypt(
                 bytearray(12),
                 base64.b64decode(transmitted_message.ciphertext),
-                ratchet.AD + transmitted_message.header.encode()
+                conversation.AD + transmitted_message.header.encode()
             ).decode()
 
             # Create stored message object and commit
             message = Message(
-                ratchet_id=ratchet.id,
+                conversation_id=conversation.peer_id,
                 content=plaintext,
                 timestamp=transmitted_message.header.timestamp,
                 sent=False
@@ -413,7 +413,7 @@ class Conversation:
     async def messages(self):
         async with AsyncSession(self.engine) as session:
             result = await session.exec(
-                select(Message).where(Message.ratchet_id == self.ratchet_id).order_by(Message.timestamp)
+                select(Message).where(Message.conversation_id == self.conversation_id).order_by(Message.timestamp)
             )
             return result.all()
 
@@ -491,19 +491,19 @@ class DreamClient(App):
 
         async with AsyncSession(self.engine) as session:
             # Check for an existing ratchet for the recipient
-            query = select(Ratchet).where(Ratchet.name == self.recipient)
-            ratchet = (await session.exec(query)).one_or_none()
-            if ratchet:
+            query = select(ConversationState).where(ConversationState.peer_name == self.recipient)
+            conversation = (await session.exec(query)).one_or_none()
+            if conversation:
                 self.conversation = Conversation(
                     engine=self.engine,
-                    ratchet_id=ratchet.id
+                    conv_state_id=conversation.peer_id
                 )
                 return  # Existing conversation ensures existing user
 
             # Check if the user is already registered in the local database
             user_info = await session.get(UserInfo, self.username)
             if not user_info:
-                raise RuntimeError("User not registered in the local database.")
+                raise RuntimeError("User not registered in the local database. Did you register?")
 
     @work(exclusive=True)
     async def open_websocket(self) -> None:

@@ -49,6 +49,7 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/dream_messenger
+      - JWT_SECRET=REPLACE_WITH_SECURE_VALUE
     networks:
       - dream-network
 
